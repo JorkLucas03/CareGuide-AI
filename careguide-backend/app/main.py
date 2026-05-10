@@ -22,6 +22,7 @@ from app.db.database import (
 )
 from app.models.chat import ChatRequest, ChatResponse
 from app.services.triage import (
+    GENERAL_SPECIALTY,
     TIER_MAP,
     TriageResult,
     analyze_message,
@@ -327,6 +328,13 @@ def _max_historical_urgency(messages: list[str]) -> int:
     return max_level
 
 
+def _resolve_specialty(current_analysis: TriageResult, accumulated_analysis: TriageResult) -> str:
+    if current_analysis.specialty != GENERAL_SPECIALTY:
+        return current_analysis.specialty
+
+    return accumulated_analysis.specialty
+
+
 def _resolve_insurance_from_payload(value: str | None) -> tuple[str | None, bool | None]:
     if not value:
         return None, None
@@ -366,21 +374,22 @@ def chat(payload: ChatRequest, http_request: Request, response: Response):
         patient_messages = get_patient_messages(session_id)
         full_symptoms = " ".join([*patient_messages, message]).strip()
 
-        analysis = analyze_message(full_symptoms)
+        current_analysis = analyze_message(message)
+        accumulated_analysis = analyze_message(full_symptoms)
         historical_urgency = _max_historical_urgency(patient_messages)
-        urgency_level = max(analysis.urgency_level, historical_urgency)
+        urgency_level = max(accumulated_analysis.urgency_level, historical_urgency, current_analysis.urgency_level)
         if DEBUG_TRIAGE:
             _log(
-                f"DEBUG: session={session_id} historical={historical_urgency} current={analysis.urgency_level} total={urgency_level} messages={len(patient_messages)}"
+                f"DEBUG: session={session_id} historical={historical_urgency} current={current_analysis.urgency_level} accumulated={accumulated_analysis.urgency_level} total={urgency_level} messages={len(patient_messages)}"
             )
         payload_tier, payload_has_insurance = _resolve_insurance_from_payload(payload.insuranceTier)
-        insurance_tier = payload_tier or analysis.insurance_tier
+        insurance_tier = payload_tier or current_analysis.insurance_tier or accumulated_analysis.insurance_tier
         if payload_has_insurance is None:
-            insurance_available = analysis.has_insurance
+            insurance_available = current_analysis.has_insurance and accumulated_analysis.has_insurance
         else:
             insurance_available = payload_has_insurance
 
-        specialty = analysis.specialty
+        specialty = _resolve_specialty(current_analysis, accumulated_analysis)
         cost_model = _build_cost_model(urgency_level, specialty, insurance_tier)
         use_db_cost = cost_model and (not insurance_available or cost_model.get("has_coverage_data"))
         if use_db_cost:
@@ -405,8 +414,14 @@ def chat(payload: ChatRequest, http_request: Request, response: Response):
             has_insurance=insurance_available,
         )
 
-        # Inyectamos el contexto médico calculado a la IA
-        contextual_message = f"{history_text}Contexto interno: El paciente tiene urgencia {urgency_level}/5 y requiere {specialty}. \n\nMensaje original del paciente: {message}"
+        # Inyectamos el contexto medico calculado a la IA
+        contextual_message = (
+            f"{history_text}"
+            f"Contexto interno: El paciente tiene urgencia {urgency_level}/5 y requiere {specialty}. "
+            f"Sintomas acumulados reportados: {full_symptoms}. "
+            f"Usa el ultimo mensaje para ajustar el foco clinico sin olvidar sintomas previos.\n\n"
+            f"Mensaje original del paciente: {message}"
+        )
         
         raw_reply = None
         if GROQ_API_KEY_PRESENT:

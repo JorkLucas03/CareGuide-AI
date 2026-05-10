@@ -13,6 +13,8 @@ class TriageResult:
     has_insurance: bool
 
 
+GENERAL_SPECIALTY = "Medicina general"
+
 TIER_MAP = {
     "oro": "Oro",
     "plata": "Plata",
@@ -29,6 +31,10 @@ NO_INSURANCE_PHRASES = [
 
 SPECIALTY_RULES: list[tuple[str, list[str]]] = [
     ("Cardiologia", [
+        "paro cardiaco",
+        "paro del corazon",
+        "ataque cardiaco",
+        "ataque al corazon",
         "dolor de pecho",
         "dolor toracico",
         "pecho",
@@ -54,6 +60,8 @@ SPECIALTY_RULES: list[tuple[str, list[str]]] = [
     ]),
     ("Neurologia", [
         "dolor de cabeza",
+        "duele la cabeza",
+        "cabeza",
         "cefalea",
         "migra",
         "migrana",
@@ -148,6 +156,13 @@ SPECIALTY_RULES: list[tuple[str, list[str]]] = [
         "calculos renales",
     ]),
     ("Urologia", [
+        "pene",
+        "peniano",
+        "testiculo",
+        "testiculos",
+        "testicular",
+        "escroto",
+        "dolor genital",
         "orina",
         "orinar",
         "urin",
@@ -766,10 +781,20 @@ def has_insurance(normalized_text: str) -> bool:
 
 
 def estimate_specialty(normalized_text: str) -> str:
+    latest_match: tuple[int, str] | None = None
     for specialty, keywords in SPECIALTY_RULES:
-        if any(keyword in normalized_text for keyword in keywords):
-            return specialty
-    return "Medicina general"
+        for keyword in keywords:
+            position = normalized_text.rfind(keyword)
+            if position == -1:
+                continue
+
+            if latest_match is None or position > latest_match[0]:
+                latest_match = (position, specialty)
+
+    if latest_match is not None:
+        return latest_match[1]
+
+    return GENERAL_SPECIALTY
 
 
 def estimate_urgency(normalized_text: str) -> int:
@@ -789,7 +814,11 @@ def estimate_urgency(normalized_text: str) -> int:
     if _matches_any_pattern(normalized_text, HIGH_URGENCY_PATTERNS):
         urgency = max(urgency, 4)
 
-    if urgency == 1 and ("dolor" in normalized_text or _matches_any_pattern(normalized_text, AMBIGUOUS_SYMPTOM_PATTERNS)):
+    if urgency == 1 and (
+        "dolor" in normalized_text
+        or "duele" in normalized_text
+        or _matches_any_pattern(normalized_text, AMBIGUOUS_SYMPTOM_PATTERNS)
+    ):
         urgency = 2
 
     if urgency < 5 and any(word in normalized_text for word in INTENSITY_WORDS):

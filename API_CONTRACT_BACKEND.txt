@@ -1,0 +1,70 @@
+CareGuide AI - Backend API Contract (v2)
+
+Endpoint
+- POST /chat
+- Content-Type: application/json
+
+Request
+{
+  "message": "string (required)"
+}
+
+Behavior
+- The backend calls the AI agent for a natural language reply (text only).
+- The backend calculates urgency and specialty with heuristic rules.
+- Copay is estimated from local rules (base cost + urgency multiplier + insurance tier).
+- Hospitals are suggested when urgency >= 4 or the message asks for hospitals/tiers.
+- If Supabase is not available, the backend falls back to a static list.
+- Recommendations can be stored in Supabase when SAVE_RECOMMENDATIONS=true.
+
+Response
+{
+  "id": "uuid",
+  "reply": "string",
+  "urgencyLevel": 1..5,
+  "specialty": "string",
+  "latencyMs": 0,
+  "cost": {
+    "base": 0,
+    "coverage": 0,
+    "copay": 0
+  },
+  "hospitals": [
+    {
+      "id": "string",
+      "name": "string",
+      "address": "string",
+      "distanceKm": 0,
+      "tier": "Oro|Plata|Bronce|General"
+    }
+  ]
+}
+
+Error responses
+- 400: { "detail": "message is required" }
+
+Supabase tables used
+- hospitals (id, name, address, accepted_tiers, lat, lon)
+- hospital_recommendations (optional, for storing recommendations)
+
+Notes for frontend
+- Keep response shape exactly as above.
+- The field urgencyLevel is number 1..5.
+- The assistant reply is plain text without Markdown.
+
+Example
+Request:
+{ "message": "dolor de pecho hace 2 horas" }
+
+Response (example):
+{
+  "id": "8c1b2...",
+  "reply": "...",
+  "urgencyLevel": 5,
+  "specialty": "Cardiologia",
+  "latencyMs": 912,
+  "cost": { "base": 90, "coverage": 72, "copay": 18 },
+  "hospitals": [
+    { "id": "2", "name": "Hospital del IESS Manta", "address": "Via a San Mateo, Manta", "distanceKm": 1.4, "tier": "Oro" }
+  ]
+}

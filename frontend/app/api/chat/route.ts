@@ -57,5 +57,6 @@ export async function POST(request: Request) {
     },
     showCost: (data.showCost as boolean | undefined) ?? true,
     hospitals: (data.hospitals as unknown[]) ?? [],
+    bestOption: data.bestOption ?? null,
   });
 }

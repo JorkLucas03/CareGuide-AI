@@ -317,6 +317,39 @@ def _attach_hospital_costs_db(
     return hospitals
 
 
+def _build_best_option(
+    hospitals: list[dict],
+    specialty: str,
+    insurance_tier: str | None,
+    insurance_available: bool,
+    show_cost: bool,
+) -> dict | None:
+    if not show_cost:
+        return None
+
+    priced_hospitals = [
+        hospital
+        for hospital in hospitals
+        if isinstance(hospital.get("estimatedCost"), dict)
+        and isinstance(hospital["estimatedCost"].get("copay"), (int, float))
+    ]
+    if not priced_hospitals:
+        return None
+
+    best = min(priced_hospitals, key=lambda item: item["estimatedCost"]["copay"])
+    plan_label = insurance_tier if insurance_available and insurance_tier else "pago particular"
+    reason = f"Menor copago estimado para {specialty} con {plan_label}."
+
+    return {
+        "hospitalId": str(best.get("id")),
+        "hospitalName": best.get("name") or "Hospital recomendado",
+        "address": best.get("address") or "Manta",
+        "tier": best.get("tier") or plan_label,
+        "estimatedCost": best["estimatedCost"],
+        "reason": reason,
+    }
+
+
 def _max_historical_urgency(messages: list[str]) -> int:
     max_level = 1
     for text in messages:
@@ -474,6 +507,14 @@ def chat(payload: ChatRequest, http_request: Request, response: Response):
         if DEBUG_TRIAGE:
             _log(f"DEBUG /chat: returning {len(hospitals)} hospitals in response")
 
+        best_option = _build_best_option(
+            hospitals,
+            specialty,
+            insurance_tier,
+            insurance_available,
+            show_cost,
+        )
+
         if hospitals:
             save_recommendations(message, hospitals)
 
@@ -497,6 +538,7 @@ def chat(payload: ChatRequest, http_request: Request, response: Response):
             "cost": cost,
             "showCost": show_cost,
             "hospitals": hospitals,
+            "bestOption": best_option,
         }
     except HTTPException:
         raise
@@ -514,4 +556,5 @@ def chat(payload: ChatRequest, http_request: Request, response: Response):
             "cost": fallback_cost,
             "showCost": True,
             "hospitals": [],
+            "bestOption": None,
         }

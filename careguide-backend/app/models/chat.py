@@ -23,6 +23,15 @@ class HospitalRecommendation(BaseModel):
     estimatedCost: Optional[CostBreakdown] = None
 
 
+class BestHospitalOption(BaseModel):
+    hospitalId: str
+    hospitalName: str
+    address: str
+    tier: str
+    estimatedCost: CostBreakdown
+    reason: str
+
+
 class ChatResponse(BaseModel):
     id: str
     sessionId: str
@@ -33,3 +42,4 @@ class ChatResponse(BaseModel):
     cost: CostBreakdown
     showCost: bool = True
     hospitals: list[HospitalRecommendation]
+    bestOption: Optional[BestHospitalOption] = None

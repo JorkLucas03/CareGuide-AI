@@ -37,6 +37,15 @@ type Hospital = {
   estimatedCost?: CostBreakdown | null;
 };
 
+type BestOption = {
+  hospitalId: string;
+  hospitalName: string;
+  address: string;
+  tier: string;
+  estimatedCost: CostBreakdown;
+  reason: string;
+};
+
 type ChatResponse = {
   id: string;
   sessionId?: string;
@@ -47,6 +56,7 @@ type ChatResponse = {
   cost: CostBreakdown;
   showCost?: boolean;
   hospitals: Hospital[];
+  bestOption?: BestOption | null;
 };
 
 type Message = {
@@ -330,6 +340,7 @@ export default function Home() {
   const costTotal = showCost ? Math.max(costBase, costCoverage + costCopay, 1) : 1;
   const coveragePct = showCost ? Math.min(100, (costCoverage / costTotal) * 100) : 0;
   const copayPct = showCost ? Math.min(100 - coveragePct, (costCopay / costTotal) * 100) : 0;
+  const bestOption = response?.bestOption ?? null;
 
   useEffect(() => {
     if (!bottomRef.current) return;
@@ -819,6 +830,39 @@ export default function Home() {
             </CardContent>
           </Card>
           </div>
+
+          {bestOption && showCost ? (
+            <Card
+              className="shrink-0 border-emerald-500/30 bg-emerald-950/30 backdrop-blur-xl shadow-xl shadow-emerald-950/20 animate-in fade-in slide-in-from-right-8 duration-700 fill-mode-both"
+              style={{ animationDelay: '380ms' }}
+            >
+              <CardHeader className="pb-3 border-b border-emerald-500/20">
+                <CardTitle className="text-base font-[var(--font-heading)] font-semibold flex items-center gap-2 text-emerald-100">
+                  <DollarSign className="h-4 w-4 text-emerald-300" /> Mejor hospital para tu plan
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="pt-4">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_auto] sm:items-center">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="truncate text-lg font-bold text-slate-50">{bestOption.hospitalName}</p>
+                      <span className="rounded-full border border-emerald-400/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] uppercase tracking-wider text-emerald-200">
+                        {bestOption.tier}
+                      </span>
+                    </div>
+                    <p className="mt-1 line-clamp-1 text-sm text-slate-300">{bestOption.address}</p>
+                    <p className="mt-2 text-sm leading-6 text-emerald-100/90">{bestOption.reason}</p>
+                  </div>
+                  <div className="rounded-lg border border-emerald-500/30 bg-slate-950/50 px-4 py-3 text-left sm:text-right">
+                    <p className="text-xs uppercase tracking-wider text-slate-400">Copago estimado</p>
+                    <p className="mt-1 font-mono text-2xl font-bold text-emerald-300">
+                      {formatCurrency(bestOption.estimatedCost.copay)}
+                    </p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
 
           {response?.hospitals?.length ? (
             <Card

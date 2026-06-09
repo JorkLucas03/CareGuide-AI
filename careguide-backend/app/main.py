@@ -36,6 +36,7 @@ app = FastAPI(title="CareGuide AI Backend")
 
 DEBUG_TRIAGE = os.environ.get("DEBUG_TRIAGE", "false").lower() in {"1", "true", "yes"}
 GROQ_API_KEY_PRESENT = bool(os.environ.get("GROQ_API_KEY"))
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in {"1", "true", "yes"}
 DEFAULT_ERROR_REPLY = "No pude procesar tu mensaje. Intenta otra vez."
 
 
@@ -404,7 +405,13 @@ def _resolve_insurance_from_payload(value: str | None) -> tuple[str | None, bool
 def _resolve_session(payload: ChatRequest, http_request: Request, response: Response) -> str:
     cookie_session = http_request.cookies.get("cg_session_id")
     session_id = payload.sessionId or cookie_session or str(uuid4())
-    response.set_cookie(key="cg_session_id", value=session_id, httponly=False, samesite="lax")
+    response.set_cookie(
+        key="cg_session_id",
+        value=session_id,
+        httponly=False,
+        samesite="lax",
+        secure=COOKIE_SECURE,
+    )
     if DEBUG_TRIAGE:
         _log(f"DEBUG: session_source={_session_source(payload.sessionId, cookie_session)} session={session_id}")
     return session_id
@@ -641,7 +648,7 @@ def _build_error_response(session_id: str, started_at: float) -> dict:
     }
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse, responses={400: {"description": "message is required"}})
 def chat(payload: ChatRequest, http_request: Request, response: Response):
     started_at = time.time()
     session_id = _resolve_session(payload, http_request, response)

@@ -407,7 +407,7 @@ def _resolve_session(payload: ChatRequest, http_request: Request, response: Resp
     response.set_cookie(
         key="cg_session_id",
         value=session_id,
-        httponly=False,
+        httponly=True,
         samesite="lax",
         secure=True,
     )

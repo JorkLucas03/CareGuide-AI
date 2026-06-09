@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4
+from dataclasses import dataclass
 import time
 import re
 import os
@@ -35,6 +36,24 @@ app = FastAPI(title="CareGuide AI Backend")
 
 DEBUG_TRIAGE = os.environ.get("DEBUG_TRIAGE", "false").lower() in {"1", "true", "yes"}
 GROQ_API_KEY_PRESENT = bool(os.environ.get("GROQ_API_KEY"))
+DEFAULT_ERROR_REPLY = "No pude procesar tu mensaje. Intenta otra vez."
+
+
+@dataclass
+class ChatContext:
+    message: str
+    session_id: str
+    history_text: str
+    full_symptoms: str
+    urgency_level: int
+    specialty: str
+    insurance_tier: str | None
+    insurance_available: bool
+    cost_model: dict | None
+    use_db_cost: bool
+    cost: dict
+    show_cost: bool
+    analysis_for_cost: TriageResult
 
 
 def _log(message: str) -> None:
@@ -72,11 +91,11 @@ def obtener_policies():
 
 def _sanitize_reply(reply: str | None) -> str:
     if not reply:
-        return "No pude procesar tu mensaje. Intenta otra vez."
+        return DEFAULT_ERROR_REPLY
 
     lowered = reply.lower()
     if "tool_use_failed" in lowered or "failed_generation" in lowered:
-        return "No pude procesar tu mensaje. Intenta otra vez."
+        return DEFAULT_ERROR_REPLY
 
     # Limpiar código técnico o llamadas a herramientas que la IA pueda "alucinar" en el texto final
     clean_reply = re.sub(r"<function=.*?</function>", "", reply, flags=re.DOTALL)
@@ -382,179 +401,267 @@ def _resolve_insurance_from_payload(value: str | None) -> tuple[str | None, bool
     return None, None
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(payload: ChatRequest, http_request: Request, response: Response):
-    started_at = time.time()
+def _resolve_session(payload: ChatRequest, http_request: Request, response: Response) -> str:
     cookie_session = http_request.cookies.get("cg_session_id")
     session_id = payload.sessionId or cookie_session or str(uuid4())
     response.set_cookie(key="cg_session_id", value=session_id, httponly=False, samesite="lax")
     if DEBUG_TRIAGE:
-        if payload.sessionId:
-            session_source = "body"
-        elif cookie_session:
-            session_source = "cookie"
-        else:
-            session_source = "new"
-        _log(f"DEBUG: session_source={session_source} session={session_id}")
-    try:
-        message = payload.message.strip()
-        if not message:
-            raise HTTPException(status_code=400, detail="message is required")
+        _log(f"DEBUG: session_source={_session_source(payload.sessionId, cookie_session)} session={session_id}")
+    return session_id
 
-        history_text = get_chat_history(session_id)
 
-        # Acumulamos todos los sintomas previos del paciente para que el Triage no olvide emergencias
-        patient_messages = get_patient_messages(session_id)
-        full_symptoms = " ".join([*patient_messages, message]).strip()
+def _session_source(payload_session: str | None, cookie_session: str | None) -> str:
+    if payload_session:
+        return "body"
+    if cookie_session:
+        return "cookie"
+    return "new"
 
-        current_analysis = analyze_message(message)
-        accumulated_analysis = analyze_message(full_symptoms)
-        historical_urgency = _max_historical_urgency(patient_messages)
-        urgency_level = max(accumulated_analysis.urgency_level, historical_urgency, current_analysis.urgency_level)
+
+def _validate_message(payload: ChatRequest) -> str:
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    return message
+
+
+def _resolve_urgency(
+    current_analysis: TriageResult,
+    accumulated_analysis: TriageResult,
+    patient_messages: list[str],
+    session_id: str,
+) -> int:
+    historical_urgency = _max_historical_urgency(patient_messages)
+    urgency_level = max(accumulated_analysis.urgency_level, historical_urgency, current_analysis.urgency_level)
+    if DEBUG_TRIAGE:
+        _log(
+            f"DEBUG: session={session_id} historical={historical_urgency} current={current_analysis.urgency_level} accumulated={accumulated_analysis.urgency_level} total={urgency_level} messages={len(patient_messages)}"
+        )
+    return urgency_level
+
+
+def _resolve_insurance(payload: ChatRequest, current_analysis: TriageResult, accumulated_analysis: TriageResult):
+    payload_tier, payload_has_insurance = _resolve_insurance_from_payload(payload.insuranceTier)
+    insurance_tier = payload_tier or current_analysis.insurance_tier or accumulated_analysis.insurance_tier
+    insurance_available = payload_has_insurance
+    if insurance_available is None:
+        insurance_available = current_analysis.has_insurance and accumulated_analysis.has_insurance
+    return insurance_tier, insurance_available
+
+
+def _resolve_cost(
+    urgency_level: int,
+    specialty: str,
+    insurance_tier: str | None,
+    insurance_available: bool,
+) -> tuple[dict | None, bool, dict]:
+    cost_model = _build_cost_model(urgency_level, specialty, insurance_tier)
+    use_db_cost = bool(cost_model and (not insurance_available or cost_model.get("has_coverage_data")))
+    if use_db_cost:
+        cost = _apply_coverage(
+            cost_model.get("base_cost"),
+            cost_model.get("coverage_rate"),
+            cost_model.get("flat_copay"),
+            insurance_available,
+        )
+    else:
+        cost = estimate_cost(
+            specialty,
+            urgency_level,
+            insurance_tier,
+            insurance_available,
+        )
+    return cost_model, use_db_cost, cost
+
+
+def _build_chat_context(payload: ChatRequest, session_id: str) -> ChatContext:
+    message = _validate_message(payload)
+    history_text = get_chat_history(session_id)
+    patient_messages = get_patient_messages(session_id)
+    full_symptoms = " ".join([*patient_messages, message]).strip()
+    current_analysis = analyze_message(message)
+    accumulated_analysis = analyze_message(full_symptoms)
+    urgency_level = _resolve_urgency(current_analysis, accumulated_analysis, patient_messages, session_id)
+    insurance_tier, insurance_available = _resolve_insurance(payload, current_analysis, accumulated_analysis)
+    specialty = _resolve_specialty(current_analysis, accumulated_analysis)
+    cost_model, use_db_cost, cost = _resolve_cost(
+        urgency_level,
+        specialty,
+        insurance_tier,
+        insurance_available,
+    )
+    show_cost = urgency_level < 4
+    analysis_for_cost = TriageResult(
+        urgency_level=urgency_level,
+        specialty=specialty,
+        insurance_tier=insurance_tier,
+        has_insurance=insurance_available,
+    )
+    return ChatContext(
+        message=message,
+        session_id=session_id,
+        history_text=history_text,
+        full_symptoms=full_symptoms,
+        urgency_level=urgency_level,
+        specialty=specialty,
+        insurance_tier=insurance_tier,
+        insurance_available=insurance_available,
+        cost_model=cost_model,
+        use_db_cost=use_db_cost,
+        cost=cost,
+        show_cost=show_cost,
+        analysis_for_cost=analysis_for_cost,
+    )
+
+
+def _build_contextual_message(context: ChatContext) -> str:
+    return (
+        f"{context.history_text}"
+        f"Contexto interno: El paciente tiene urgencia {context.urgency_level}/5 y requiere {context.specialty}. "
+        f"Sintomas acumulados reportados: {context.full_symptoms}. "
+        f"Usa el ultimo mensaje para ajustar el foco clinico sin olvidar sintomas previos.\n\n"
+        f"Mensaje original del paciente: {context.message}"
+    )
+
+
+def _get_ai_reply(contextual_message: str) -> str:
+    raw_reply = None
+    if GROQ_API_KEY_PRESENT:
+        try:
+            result = careguide_ai.run(contextual_message)
+            raw_reply = result.content if hasattr(result, "content") else str(result)
+        except Exception:
+            raw_reply = None
+
+    if not isinstance(raw_reply, str):
+        raw_reply = "" if raw_reply is None else str(raw_reply)
+
+    return _sanitize_reply(raw_reply)
+
+
+def _build_hospital_search_query(message: str, insurance_tier: str | None) -> str:
+    if insurance_tier and insurance_tier.lower() not in message.lower():
+        return f"{message} seguro {insurance_tier}"
+    return f"{message} hospital en Manta"
+
+
+def _build_contract_map(cost_model: dict | None, hospitals: list[dict]) -> dict:
+    if not cost_model or not cost_model.get("policy_id"):
+        return {}
+    hospital_ids = [hospital.get("id") for hospital in hospitals if hospital.get("id") is not None]
+    return get_contracts_for_policy(cost_model.get("policy_id"), hospital_ids)
+
+
+def _attach_costs_to_hospitals(context: ChatContext, hospitals: list[dict], raw: list[dict]) -> list[dict]:
+    if not context.show_cost:
+        return hospitals
+
+    if context.use_db_cost:
+        hospitals = _attach_hospital_costs_db(
+            hospitals,
+            raw,
+            context.analysis_for_cost,
+            context.cost_model,
+            _build_contract_map(context.cost_model, hospitals),
+            context.insurance_available,
+        )
         if DEBUG_TRIAGE:
-            _log(
-                f"DEBUG: session={session_id} historical={historical_urgency} current={current_analysis.urgency_level} accumulated={accumulated_analysis.urgency_level} total={urgency_level} messages={len(patient_messages)}"
-            )
-        payload_tier, payload_has_insurance = _resolve_insurance_from_payload(payload.insuranceTier)
-        insurance_tier = payload_tier or current_analysis.insurance_tier or accumulated_analysis.insurance_tier
-        if payload_has_insurance is None:
-            insurance_available = current_analysis.has_insurance and accumulated_analysis.has_insurance
-        else:
-            insurance_available = payload_has_insurance
+            _log(f"DEBUG /chat: after _attach_hospital_costs_db: {len(hospitals)} hospitals")
+        return hospitals
 
-        specialty = _resolve_specialty(current_analysis, accumulated_analysis)
-        cost_model = _build_cost_model(urgency_level, specialty, insurance_tier)
-        use_db_cost = cost_model and (not insurance_available or cost_model.get("has_coverage_data"))
-        if use_db_cost:
-            cost = _apply_coverage(
-                cost_model.get("base_cost"),
-                cost_model.get("coverage_rate"),
-                cost_model.get("flat_copay"),
-                insurance_available,
-            )
-        else:
-            cost = estimate_cost(
-                specialty,
-                urgency_level,
-                insurance_tier,
-                insurance_available,
-            )
-        show_cost = urgency_level < 4
-        analysis_for_cost = TriageResult(
-            urgency_level=urgency_level,
-            specialty=specialty,
-            insurance_tier=insurance_tier,
-            has_insurance=insurance_available,
-        )
+    hospitals = _attach_hospital_costs(hospitals, raw, context.analysis_for_cost)
+    if DEBUG_TRIAGE:
+        _log(f"DEBUG /chat: after _attach_hospital_costs: {len(hospitals)} hospitals")
+    return hospitals
 
-        # Inyectamos el contexto medico calculado a la IA
-        contextual_message = (
-            f"{history_text}"
-            f"Contexto interno: El paciente tiene urgencia {urgency_level}/5 y requiere {specialty}. "
-            f"Sintomas acumulados reportados: {full_symptoms}. "
-            f"Usa el ultimo mensaje para ajustar el foco clinico sin olvidar sintomas previos.\n\n"
-            f"Mensaje original del paciente: {message}"
-        )
-        
-        raw_reply = None
-        if GROQ_API_KEY_PRESENT:
-            try:
-                result = careguide_ai.run(contextual_message)
-                raw_reply = result.content if hasattr(result, "content") else str(result)
-            except Exception:
-                raw_reply = None
 
-        if not isinstance(raw_reply, str):
-            raw_reply = "" if raw_reply is None else str(raw_reply)
+def _get_hospital_recommendations(context: ChatContext) -> list[dict]:
+    hospital_tier = context.insurance_tier or ("General" if not context.insurance_available else None)
+    raw = search_hospitals(_build_hospital_search_query(context.message, context.insurance_tier))
+    if DEBUG_TRIAGE:
+        count = len(raw) if isinstance(raw, list) else "ERROR"
+        _log(f"DEBUG /chat: search_hospitals returned {count} items")
 
-        reply = _sanitize_reply(raw_reply)
+    if not isinstance(raw, list):
+        return []
 
-        hospitals: list[dict] = []
-        suggest_hospitals = True
-        if suggest_hospitals:
-            hospital_tier = insurance_tier or ("General" if not insurance_available else None)
-            search_query = f"{message} hospital en Manta"
-            if insurance_tier and insurance_tier.lower() not in message.lower():
-                search_query = f"{message} seguro {insurance_tier}"
-            raw = search_hospitals(search_query)
-            if DEBUG_TRIAGE:
-                _log(f"DEBUG /chat: search_hospitals returned {len(raw) if isinstance(raw, list) else 'ERROR'} items")
-            if isinstance(raw, list):
-                hospitals = _build_hospital_payload(raw, hospital_tier)
-                if DEBUG_TRIAGE:
-                    _log(f"DEBUG /chat: after _build_hospital_payload: {len(hospitals)} hospitals")
-                contract_map: dict = {}
-                if cost_model and cost_model.get("policy_id"):
-                    hospital_ids = [hospital.get("id") for hospital in hospitals if hospital.get("id") is not None]
-                    contract_map = get_contracts_for_policy(cost_model.get("policy_id"), hospital_ids)
-                if show_cost:
-                    if use_db_cost:
-                        hospitals = _attach_hospital_costs_db(
-                            hospitals,
-                            raw,
-                            analysis_for_cost,
-                            cost_model,
-                            contract_map,
-                            insurance_available,
-                        )
-                        if DEBUG_TRIAGE:
-                            _log(f"DEBUG /chat: after _attach_hospital_costs_db: {len(hospitals)} hospitals")
-                    else:
-                        hospitals = _attach_hospital_costs(hospitals, raw, analysis_for_cost)
-                        if DEBUG_TRIAGE:
-                            _log(f"DEBUG /chat: after _attach_hospital_costs: {len(hospitals)} hospitals")
+    hospitals = _build_hospital_payload(raw, hospital_tier)
+    if DEBUG_TRIAGE:
+        _log(f"DEBUG /chat: after _build_hospital_payload: {len(hospitals)} hospitals")
+    return _attach_costs_to_hospitals(context, hospitals, raw)
+
+
+def _append_hospital_suggestions(reply: str, hospitals: list[dict]) -> str:
+    if not hospitals or "hospital" in reply.lower():
+        return reply
+
+    top = hospitals[:3]
+    suggestion_text = ", ".join(f"{hospital['name']} ({hospital['tier']})" for hospital in top)
+    return f"{reply}\n\nSugerencias: {suggestion_text}."
+
+
+def _build_chat_response(context: ChatContext, reply: str, hospitals: list[dict], started_at: float) -> dict:
+    best_option = _build_best_option(
+        hospitals,
+        context.specialty,
+        context.insurance_tier,
+        context.insurance_available,
+        context.show_cost,
+    )
+    latency_ms = int((time.time() - started_at) * 1000)
+
+    return {
+        "id": str(uuid4()),
+        "sessionId": context.session_id,
+        "reply": reply,
+        "urgencyLevel": context.urgency_level,
+        "specialty": context.specialty,
+        "latencyMs": latency_ms,
+        "cost": context.cost,
+        "showCost": context.show_cost,
+        "hospitals": hospitals,
+        "bestOption": best_option,
+    }
+
+
+def _build_error_response(session_id: str, started_at: float) -> dict:
+    latency_ms = int((time.time() - started_at) * 1000)
+    fallback_cost = estimate_cost("Medicina general", 2, None, True)
+    return {
+        "id": str(uuid4()),
+        "sessionId": session_id,
+        "reply": DEFAULT_ERROR_REPLY,
+        "urgencyLevel": 2,
+        "specialty": "Medicina general",
+        "latencyMs": latency_ms,
+        "cost": fallback_cost,
+        "showCost": True,
+        "hospitals": [],
+        "bestOption": None,
+    }
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(payload: ChatRequest, http_request: Request, response: Response):
+    started_at = time.time()
+    session_id = _resolve_session(payload, http_request, response)
+    try:
+        context = _build_chat_context(payload, session_id)
+        reply = _get_ai_reply(_build_contextual_message(context))
+        hospitals = _get_hospital_recommendations(context)
 
         if DEBUG_TRIAGE:
             _log(f"DEBUG /chat: returning {len(hospitals)} hospitals in response")
 
-        best_option = _build_best_option(
-            hospitals,
-            specialty,
-            insurance_tier,
-            insurance_available,
-            show_cost,
-        )
-
         if hospitals:
-            save_recommendations(message, hospitals)
+            save_recommendations(context.message, hospitals)
+            reply = _append_hospital_suggestions(reply, hospitals)
 
-            if "hospital" not in reply.lower():
-                top = hospitals[:3]
-                suggestion_text = ", ".join(f"{hospital['name']} ({hospital['tier']})" for hospital in top)
-                reply = f"{reply}\n\nSugerencias: {suggestion_text}."
-
-        save_chat_message(session_id, "Paciente", message)
+        save_chat_message(session_id, "Paciente", context.message)
         save_chat_message(session_id, "IA", reply)
-
-        latency_ms = int((time.time() - started_at) * 1000)
-
-        return {
-            "id": str(uuid4()),
-            "sessionId": session_id,
-            "reply": reply,
-            "urgencyLevel": urgency_level,
-            "specialty": specialty,
-            "latencyMs": latency_ms,
-            "cost": cost,
-            "showCost": show_cost,
-            "hospitals": hospitals,
-            "bestOption": best_option,
-        }
+        return _build_chat_response(context, reply, hospitals, started_at)
     except HTTPException:
         raise
     except Exception as exc:
         _log(f"ERROR /chat: {exc}")
-        latency_ms = int((time.time() - started_at) * 1000)
-        fallback_cost = estimate_cost("Medicina general", 2, None, True)
-        return {
-            "id": str(uuid4()),
-            "sessionId": session_id,
-            "reply": "No pude procesar tu mensaje. Intenta otra vez.",
-            "urgencyLevel": 2,
-            "specialty": "Medicina general",
-            "latencyMs": latency_ms,
-            "cost": fallback_cost,
-            "showCost": True,
-            "hospitals": [],
-            "bestOption": None,
-        }
+        return _build_error_response(session_id, started_at)

@@ -58,105 +58,97 @@ FALLBACK_HOSPITALS = [
     },
 ]
 
+
+STOP_WORDS_PATTERN = r"\b(hospitales|hospital|hospita|clinicas|clinica|clinic|seguro|quiero|busco|necesito|un|una|en manta)\b"
+TIERS = ["oro", "plata", "bronce"]
+GENERAL_REQUEST_TOKENS = ["hospital", "clinica", "recomend", "diabet", "chequeo"]
+
+
+def _not_found_message(query: str) -> str:
+    return f"No se encontraron resultados para '{query}'. Intenta buscando por 'Oro', 'Plata' o nombres especificos."
+
+
+def _extract_search_terms(query: str) -> tuple[str, str | None, bool]:
+    lower_query = query.lower()
+    cleaned_query = re.sub(STOP_WORDS_PATTERN, "", lower_query)
+    keyword = cleaned_query.strip().capitalize()
+    requested_tier = next((tier for tier in TIERS if tier in lower_query), None)
+    is_general_request = any(token in lower_query for token in GENERAL_REQUEST_TOKENS)
+    return keyword, requested_tier, is_general_request
+
+
+def _filter_by_tier(hospitals: list[dict], requested_tier: str | None) -> list[dict]:
+    if not requested_tier:
+        return []
+
+    requested_label = requested_tier.capitalize()
+    return [
+        hospital
+        for hospital in hospitals
+        if requested_label in (hospital.get("accepted_tiers") or [])
+    ]
+
+
+def _filter_by_name(hospitals: list[dict], keyword: str) -> list[dict]:
+    if not keyword:
+        return []
+
+    keyword_lower = keyword.lower()
+    return [
+        hospital
+        for hospital in hospitals
+        if keyword_lower in (hospital.get("name") or "").lower()
+    ]
+
+
+def _select_hospitals(
+    hospitals: list[dict],
+    requested_tier: str | None,
+    keyword: str,
+    is_general_request: bool,
+    query: str,
+) -> list[dict] | str:
+    tier_matches = _filter_by_tier(hospitals, requested_tier)
+    if tier_matches:
+        return tier_matches
+
+    name_matches = _filter_by_name(hospitals, keyword)
+    if name_matches:
+        return name_matches
+
+    if is_general_request and hospitals:
+        return hospitals
+
+    return _not_found_message(query)
+
+
 def search_hospitals(query: str):
     """
     Busca hospitales en Manta por nombre o por nivel de seguro (Oro, Plata, Bronce).
     """
     # Limpiamos la consulta para extraer la palabra clave (ej: de 'Seguro Oro' a 'Oro')
-    lower_query = query.lower()
+    keyword, requested_tier, is_general_request = _extract_search_terms(query)
     
     # Usamos expresiones regulares para ignorar errores ortográficos comunes y palabras de relleno
-    stop_words_pattern = r'\b(hospitales|hospital|hospita|clinicas|clinica|clinic|seguro|quiero|busco|necesito|un|una|en manta)\b'
-    cleaned_query = re.sub(stop_words_pattern, '', lower_query)
-    keyword = cleaned_query.strip()
-    keyword = keyword.capitalize() if keyword else ""
-
-    tiers = ["oro", "plata", "bronce"]
-    requested_tier = next((tier for tier in tiers if tier in lower_query), None)
-    is_general_request = any(
-        token in lower_query for token in ["hospital", "clinica", "recomend", "diabet", "chequeo"]
-    )
     
     if DEBUG_SUPABASE:
         _log(f"DEBUG: searching hospitals with keyword '{keyword}'")
     
     if db_client is None:
-        if requested_tier:
-            requested_label = requested_tier.capitalize()
-            tier_matches = [
-                hospital
-                for hospital in FALLBACK_HOSPITALS
-                if requested_label in hospital["accepted_tiers"]
-            ]
-            if tier_matches:
-                return tier_matches
-
-        if keyword:
-            keyword_lower = keyword.lower()
-            name_matches = [
-                hospital
-                for hospital in FALLBACK_HOSPITALS
-                if keyword_lower in hospital["name"].lower()
-            ]
-            if name_matches:
-                return name_matches
-
-        if is_general_request:
-            return FALLBACK_HOSPITALS
-
-        return f"No se encontraron resultados para '{query}'. Intenta buscando por 'Oro', 'Plata' o nombres especificos."
+        return _select_hospitals(FALLBACK_HOSPITALS, requested_tier, keyword, is_general_request, query)
 
     try:
         all_hospitals = db_client.table("hospitals").select("*").execute().data or []
 
-        res_tier = []
-        if requested_tier:
-            requested_label = requested_tier.capitalize()
-            res_tier = [
-                hospital
-                for hospital in all_hospitals
-                if requested_label in (hospital.get("accepted_tiers") or [])
-            ]
-            if res_tier:
-                if DEBUG_SUPABASE:
-                    _log(f"DEBUG: found {len(res_tier)} hospitals by tier.")
-                return res_tier
-
-        if keyword:
-            res_name = [
-                hospital
-                for hospital in all_hospitals
-                if keyword.lower() in (hospital.get("name") or "").lower()
-            ]
-            if res_name:
-                if DEBUG_SUPABASE:
-                    _log(f"DEBUG: found {len(res_name)} hospitals by name.")
-                return res_name
-
-        if is_general_request:
-            if all_hospitals:
-                if DEBUG_SUPABASE:
-                    _log(f"DEBUG: found {len(all_hospitals)} hospitals.")
-                return all_hospitals
-
-        return f"No se encontraron resultados para '{query}'. Intenta buscando por 'Oro', 'Plata' o nombres específicos."
+        results = _select_hospitals(all_hospitals, requested_tier, keyword, is_general_request, query)
+        if DEBUG_SUPABASE and isinstance(results, list):
+            _log(f"DEBUG: found {len(results)} hospitals.")
+        return results
 
     except Exception as e:
         _log(f"ERROR: database connection failed: {e}")
-        if requested_tier:
-            requested_label = requested_tier.capitalize()
-            tier_matches = [
-                hospital
-                for hospital in FALLBACK_HOSPITALS
-                if requested_label in hospital["accepted_tiers"]
-            ]
-            if tier_matches:
-                return tier_matches
-
-        if is_general_request:
-            return FALLBACK_HOSPITALS
-
-        return []
+        results = _select_hospitals(FALLBACK_HOSPITALS, requested_tier, keyword, is_general_request, query)
+        return results if isinstance(results, list) else []
 
 
 def save_recommendations(message: str, hospitals: list[dict], user_id: str | None = None) -> None:

@@ -36,7 +36,6 @@ app = FastAPI(title="CareGuide AI Backend")
 
 DEBUG_TRIAGE = os.environ.get("DEBUG_TRIAGE", "false").lower() in {"1", "true", "yes"}
 GROQ_API_KEY_PRESENT = bool(os.environ.get("GROQ_API_KEY"))
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in {"1", "true", "yes"}
 DEFAULT_ERROR_REPLY = "No pude procesar tu mensaje. Intenta otra vez."
 
 
@@ -410,7 +409,7 @@ def _resolve_session(payload: ChatRequest, http_request: Request, response: Resp
         value=session_id,
         httponly=False,
         samesite="lax",
-        secure=COOKIE_SECURE,
+        secure=True,
     )
     if DEBUG_TRIAGE:
         _log(f"DEBUG: session_source={_session_source(payload.sessionId, cookie_session)} session={session_id}")

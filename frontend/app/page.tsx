@@ -439,7 +439,7 @@ export default function Home() {
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
-      setResponse(data as ChatResponse);
+      setResponse(data);
       setLastAttemptedMessage(null);
     } catch {
       setError("No pudimos conectar con el asistente. Revisa tu red e intenta otra vez.");
